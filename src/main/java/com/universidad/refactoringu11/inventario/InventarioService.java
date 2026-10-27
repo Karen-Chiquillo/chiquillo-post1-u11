@@ -3,9 +3,13 @@ package com.universidad.refactoringu11.inventario;
 import org.springframework.stereotype.Service;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 @Service
 public class InventarioService {
+
+    private static final String ENTRADA = "ENTRADA";
+    private static final String SALIDA = "SALIDA";
 
     private final List<Producto> productos = new ArrayList<>();
     private final List<String> movimientos = new ArrayList<>();
@@ -14,48 +18,50 @@ public class InventarioService {
         productos.add(producto);
     }
 
-    // Long Method: valida, busca, actualiza stock, calcula reorden
-    // y registra/alerta, todo en un solo metodo (Bloater)
     public String actualizarInventario(Long productoId, int cantidad, String tipoMovimiento) {
+        if (!sonDatosValidos(productoId, cantidad, tipoMovimiento)) return "ERROR_DATOS_INVALIDOS";
+        return buscarProducto(productoId)
+                .map(producto -> aplicarMovimiento(producto, cantidad, tipoMovimiento))
+                .orElse("ERROR_PRODUCTO_NO_EXISTE");
+    }
 
-        // Validacion de entrada (deberia ser responsabilidad propia)
-        if (productoId == null || cantidad == 0
-                || (!tipoMovimiento.equals("ENTRADA") && !tipoMovimiento.equals("SALIDA"))) {
-            return "ERROR_DATOS_INVALIDOS";
-        }
+    private boolean sonDatosValidos(Long productoId, int cantidad, String tipoMovimiento) {
+        return productoId != null && cantidad != 0 && esTipoMovimientoValido(tipoMovimiento);
+    }
 
-        // Busqueda del producto (mezclada con la logica de negocio)
-        Producto producto = null;
-        for (Producto p : productos) {
-            if (p.getId().equals(productoId)) { producto = p; break; }
-        }
-        if (producto == null) return "ERROR_PRODUCTO_NO_EXISTE";
+    private boolean esTipoMovimientoValido(String tipoMovimiento) {
+        return tipoMovimiento.equals(ENTRADA) || tipoMovimiento.equals(SALIDA);
+    }
 
-        // Actualizacion de stock
-        int nuevoStock;
-        if (tipoMovimiento.equals("ENTRADA")) {
-            nuevoStock = producto.getStock() + cantidad;
-        } else {
-            nuevoStock = producto.getStock() - cantidad;
-            if (nuevoStock < 0) return "ERROR_STOCK_INSUFICIENTE";
-        }
+    private Optional<Producto> buscarProducto(Long productoId) {
+        return productos.stream()
+                .filter(producto -> producto.getId().equals(productoId))
+                .findFirst();
+    }
+
+    private String aplicarMovimiento(Producto producto, int cantidad, String tipoMovimiento) {
+        int nuevoStock = calcularNuevoStock(producto.getStock(), cantidad, tipoMovimiento);
+        if (tipoMovimiento.equals(SALIDA) && nuevoStock < 0) return "ERROR_STOCK_INSUFICIENTE";
         producto.setStock(nuevoStock);
+        registrarMovimiento(producto, cantidad, tipoMovimiento);
+        return producto.necesitaReorden() ? alertarReorden(producto) : "OK_" + nuevoStock;
+    }
 
-        boolean necesitaReorden = producto.necesitaReorden();
-        int cantidadReorden = producto.calcularCantidadReorden();
+    private int calcularNuevoStock(int stockActual, int cantidad, String tipoMovimiento) {
+        return tipoMovimiento.equals(ENTRADA) ? stockActual + cantidad : stockActual - cantidad;
+    }
 
-        // Registro del movimiento (responsabilidad de auditoria)
+    private void registrarMovimiento(Producto producto, int cantidad, String tipoMovimiento) {
         String registro = tipoMovimiento + " de " + cantidad + " unidades de "
-                + producto.getNombre() + " -> stock final: " + nuevoStock;
+                + producto.getNombre() + " -> stock final: " + producto.getStock();
         movimientos.add(registro);
         System.out.println(registro);
+    }
 
-        // Decision de alerta (responsabilidad de notificacion)
-        if (necesitaReorden) {
-            System.out.println("ALERTA: " + producto.getNombre()
-                    + " bajo stock minimo. Reordenar " + cantidadReorden + " unidades.");
-            return "OK_BAJO_STOCK_REORDEN_" + cantidadReorden;
-        }
-        return "OK_" + nuevoStock;
+    private String alertarReorden(Producto producto) {
+        int cantidadReorden = producto.calcularCantidadReorden();
+        System.out.println("ALERTA: " + producto.getNombre()
+                + " bajo stock minimo. Reordenar " + cantidadReorden + " unidades.");
+        return "OK_BAJO_STOCK_REORDEN_" + cantidadReorden;
     }
 }
