@@ -4,6 +4,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 
 @Service
@@ -11,15 +12,16 @@ public class InventarioService {
 
     private static final String ENTRADA = "ENTRADA";
     private static final String SALIDA = "SALIDA";
+    private static final NotificadorBajoStock SIN_NOTIFICADOR = (producto, cantidadReorden) -> { };
 
     private final List<Producto> productos = new ArrayList<>();
     private final List<String> movimientos = new ArrayList<>();
 
-    private NotificadorBajoStock notificador;
+    private NotificadorBajoStock notificador = SIN_NOTIFICADOR;
 
     @Autowired(required = false)
     public void setNotificador(NotificadorBajoStock notificador) {
-        this.notificador = notificador;
+        this.notificador = Objects.requireNonNull(notificador, "El notificador no puede ser null");
     }
 
     public void agregarProducto(Producto producto) {
@@ -68,9 +70,7 @@ public class InventarioService {
 
     private String alertarReorden(Producto producto) {
         int cantidadReorden = producto.calcularCantidadReorden();
-        if (notificador != null) {
-            notificador.notificar(producto, cantidadReorden);
-        }
+        notificador.notificar(producto, cantidadReorden);
         System.out.println("ALERTA: " + producto.getNombre()
                 + " bajo stock minimo. Reordenar " + cantidadReorden + " unidades.");
         return "OK_BAJO_STOCK_REORDEN_" + cantidadReorden;
