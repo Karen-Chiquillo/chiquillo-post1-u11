@@ -96,7 +96,9 @@ public String actualizarInventario(Long productoId, int cantidad, String tipoMov
 | `alertarReorden` | Imprimir la alerta y armar el código de respuesta |
 | `Producto.necesitaReorden` / `Producto.calcularCantidadReorden` | Regla de reorden del producto |
 
-**Un hallazgo durante el refactor:** la primera versión de `sonDatosValidos` evaluaba `tipoMovimiento.equals(...)` antes de revisar `productoId`. En el original, el `||` corta en `productoId == null`, de modo que `actualizarInventario(null, 5, null)` devuelve `ERROR_DATOS_INVALIDOS`; con el orden cambiado lanzaba `NullPointerException`. **Ninguna de las 31 pruebas cubre ese caso**, así que la suite habría seguido en verde. Se detectó revisando la equivalencia línea por línea y se corrigió respetando el orden original. Lo mismo pasa con el stock negativo: el original solo lo rechaza en `SALIDA`, y una `ENTRADA` con cantidad negativa grande deja el stock en negativo sin error; esa asimetría se conservó a propósito. La conclusión es que las pruebas de caracterización son la red de seguridad, pero no reemplazan leer el código que se está moviendo.
+**Un hallazgo durante el refactor:** la primera versión de `sonDatosValidos` evaluaba `tipoMovimiento.equals(...)` antes de revisar `productoId`. En el original, el `||` corta en `productoId == null`, de modo que `actualizarInventario(null, 5, null)` devuelve `ERROR_DATOS_INVALIDOS`; con el orden cambiado lanzaba `NullPointerException`. **Ninguna de las 31 pruebas cubre ese caso**, así que la suite habría seguido en verde. Se detectó revisando la equivalencia línea por línea y se corrigió respetando el orden original. Lo mismo pasa con el stock negativo: el original solo lo rechaza en `SALIDA`, y una `ENTRADA` con cantidad negativa grande deja el stock en negativo sin error; esa asimetría se conservó a propósito. Como ninguno de los dos casos tenía prueba, se agregó `InventarioServiceRegresionTest` (commit `7399847`) con ellos; sus 3 pruebas pasan también sobre el código original del commit `9f5752b`, así que documentan el comportamiento de partida y no el del refactor. La conclusión es que las pruebas de caracterización son la red de seguridad, pero no reemplazan leer el código que se está moviendo.
+
+**Lo que se dejó igual a propósito:** la lista `movimientos` de `InventarioService` se llena en cada movimiento pero ninguna clase la lee. Viene del código original como registro de auditoría y no tiene un método que la exponga; quitarla no cambiaría lo que se ve desde afuera, pero el enunciado no pide eliminar esa responsabilidad, así que se conservó y queda señalada aquí. Tampoco se cambiaron los códigos de retorno en `String` (`"OK_30"`, `"ERROR_DATOS_INVALIDOS"`): la guía (sección 6.4) recomienda excepciones, pero son el contrato que fijan las pruebas de caracterización, y cambiarlos sería cambiar el comportamiento observable.
 
 ### 4. Refactorización del Switch Statement duplicado
 
@@ -140,7 +142,7 @@ Los métodos de enum reciben el precio o el nombre, no el `Producto` completo: c
 
 ### 5. Resultado de `mvn test` en cada paso
 
-Las pruebas no se modificaron en ningún paso: `git diff` sobre `src/test` sale vacío desde el commit `54f5f94`.
+Las pruebas no se modificaron en ningún paso: `git diff` sobre `src/test` sale vacío entre los commits `54f5f94` y `8105258`.
 
 | Momento | Commit | Pruebas | Resultado |
 |---------|--------|---------|-----------|
@@ -215,6 +217,119 @@ Al mismo tiempo, las 30 pruebas de caracterización de la Parte 1 siguen en verd
 
 ![ArchUnit detecta el ciclo entre inventario y reportes](screenshots/p2/01-archunit-ciclo-rojo.png)
 
+### 3. Resolución del ciclo de paquetes: inversión de dependencia
+
+En el commit `dbba1a1` se aplicó el principio de Inversión de Dependencias (guía, sección 5.1). Se extrajo la interfaz `NotificadorBajoStock` en el paquete `inventario`:
+
+```java
+public interface NotificadorBajoStock {
+    void notificar(Producto producto, int cantidadReorden);
+}
+```
+
+- `InventarioService` dejó de importar `ReporteBajoStockService`: ahora guarda un `NotificadorBajoStock` (sigue llegando por setter, para no cambiar el constructor que usan las pruebas) y en la rama de reorden llama a `notificador.notificar(producto, cantidadReorden)`.
+- `ReporteBajoStockService` implementa la interfaz. Como el enunciado sugiere, `notificar()` registra la alerta y `generarReporte()` arma el texto con las alertas recibidas. Por eso `listarProductosBajoStock()` dejó de hacer falta y se eliminó de `InventarioService`.
+- Una búsqueda de `reportes` dentro del paquete `inventario` no devuelve nada.
+- El enunciado deja el notificador en `null` y lo revisa con `if (notificador != null)` en cada alerta, porque las pruebas de la Parte 1 crean `InventarioService` con `new` y nunca le asignan uno. En el commit `cf79001` se cambió por un **notificador nulo** (`SIN_NOTIFICADOR`, una implementación que no hace nada) como valor por defecto, y el setter rechaza `null` con `Objects.requireNonNull`. Así desaparece la verificación y no hay ningún `null` que pasar de un lado a otro (guía, sección 6.4).
+
+`mvn test -Dtest=ArquitecturaPaquetesTest` pasó a verde:
+
+```text
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0 -- in com.universidad.refactoringu11.ArquitecturaPaquetesTest
+[INFO] BUILD SUCCESS
+```
+
+### 4. El ciclo que ArchUnit no ve: dependencia entre beans
+
+Con la inversión hecha tal como la plantea el enunciado, ArchUnit queda en verde, pero **la aplicación sigue sin arrancar**. `ReporteBajoStockService` conservaba en su constructor el `InventarioService` del Paso 1, y Spring seguía teniendo que crear cada bean antes que el otro: `InventarioService` necesita un `NotificadorBajoStock` para su setter, y el único que existe es `ReporteBajoStockService`, que pide `InventarioService` para construirse. Lo más llamativo es que ese campo **ya no se usaba**: después de la inversión, el reporte se arma con las alertas que recibe, y el propio IDE lo marcaba como "not used".
+
+![ArchUnit en verde pero la aplicación no arranca](screenshots/p2/02-archunit-verde-app-no-arranca.png)
+
+ArchUnit revisa dependencias entre **tipos**, y a ese nivel `reportes -> inventario` es una dirección permitida. El ciclo estaba en el grafo de **objetos** que arma Spring, y solo una prueba que levante el contexto (`contextLoads`) lo detecta. Una prueba de arquitectura en verde no garantiza que la aplicación funcione.
+
+**Solución (commit `6ba4dc8`):** se eliminó la dependencia sin uso. `ReporteBajoStockService` quedó sin constructor con parámetros, y su única relación con `inventario` es implementar `NotificadorBajoStock` y leer los datos del `Producto` que recibe. Se descartaron dos alternativas que también hacen arrancar la aplicación:
+
+- **`@Lazy` en el parámetro del constructor:** Spring inyecta un proxy y crea el bean real después. El ciclo sigue existiendo, solo que escondido, y el campo seguiría sin usarse.
+- **`spring.main.allow-circular-references=true`:** el propio mensaje de Spring lo describe como "último recurso", y apaga la protección para todo el proyecto, no solo para este caso.
+
+Además se agregaron pruebas para el módulo de reportes, que no tenía ninguna:
+
+| Clase de prueba | Pruebas | Qué verifica |
+|-----------------|---------|--------------|
+| `ReporteBajoStockServiceTest` | 3 | Reporte sin alertas, registro de una alerta y que `InventarioService` avisa al reporte solo cuando un producto queda bajo el mínimo |
+| `NotificacionBajoStockIntegracionTest` | 1 | Con `@SpringBootTest`, que Spring conecta de verdad el reporte como notificador del inventario. Con `@Autowired(required = false)`, si esa conexión fallara, las alertas se perderían sin ningún error |
+
+### 5. Diagrama de paquetes después
+
+Mismo diagrama que el de antes, con los dos paquetes, pero ahora con una sola flecha:
+
+```mermaid
+flowchart LR
+    inventario["<b>inventario</b><br/>InventarioService<br/>Producto · TipoProducto<br/>«interface» NotificadorBajoStock"]
+    reportes["<b>reportes</b><br/>ReporteBajoStockService"]
+    reportes -- "implementa NotificadorBajoStock<br/>y lee datos de Producto" --> inventario
+```
+
+Queda una sola flecha entre paquetes, de `reportes` hacia `inventario`: el módulo de reportes depende del dominio y el dominio no sabe que los reportes existen.
+
+| Dirección | Antes | Después |
+|-----------|-------|---------|
+| `inventario -> reportes` | 3 dependencias (campo, setter y llamada a `generarReporte()`) | 0 |
+| `reportes -> inventario` | 7 dependencias (constructor, campo, `listarProductosBajoStock()` y 4 de `Producto`) | Implementa `NotificadorBajoStock` y usa `Producto` |
+| Ciclo entre beans de Spring | Sí, la aplicación no arranca | No |
+
+Estructura final del proyecto:
+
+```text
+chiquillo-post1-u11/
+├── pom.xml                                       ← incluye ArchUnit
+├── README.md
+├── screenshots/
+│   ├── p1/                                       ← evidencias Parte 1
+│   └── p2/                                       ← evidencias Parte 2
+└── src/
+    ├── main/java/com/universidad/refactoringu11/
+    │   ├── RefactoringU11Application.java
+    │   ├── inventario/                           ← dominio
+    │   │   ├── TipoProducto.java                 ← polimorfismo por tipo
+    │   │   ├── Producto.java                     ← regla de reorden
+    │   │   ├── InventarioService.java            ← método ya descompuesto
+    │   │   ├── ClasificadorProducto.java         ← delega en el tipo
+    │   │   ├── EtiquetadoProducto.java           ← delega en el tipo
+    │   │   └── NotificadorBajoStock.java         ← interfaz (DIP)
+    │   └── reportes/                             ← nuevo en Parte 2
+    │       └── ReporteBajoStockService.java      ← implementa la interfaz
+    └── test/java/com/universidad/refactoringu11/
+        ├── ArquitecturaPaquetesTest.java         ← ArchUnit
+        ├── RefactoringU11ApplicationTests.java   ← contextLoads
+        ├── inventario/                           ← caracterización y regresión
+        │   ├── InventarioServiceTest.java
+        │   ├── InventarioServiceCasosLimiteTest.java
+        │   ├── InventarioServiceRegresionTest.java
+        │   ├── ClasificadorProductoTest.java
+        │   └── EtiquetadoProductoTest.java
+        └── reportes/                             ← pruebas del reporte
+            ├── ReporteBajoStockServiceTest.java
+            └── NotificacionBajoStockIntegracionTest.java
+```
+
+### 6. Resultado final de las pruebas
+
+| Momento | Commit | Caracterización (30) | ArchUnit | `contextLoads` | Total |
+|---------|--------|----------------------|----------|----------------|-------|
+| Módulo de reportes agregado | `4b67cb0` | En verde | — | **En rojo** | 30 de 31 |
+| Prueba de arquitectura agregada | `db2519d` | En verde | **En rojo** | **En rojo** | 30 de 32 |
+| Inversión de dependencia | `dbba1a1` | En verde | En verde | **En rojo** | 31 de 32 |
+| Dependencia sin uso eliminada | `6ba4dc8` | En verde | En verde | En verde | 36 de 36 |
+| Pruebas de regresión agregadas | `7399847` | En verde | En verde | En verde | 39 de 39 |
+| Notificador nulo en lugar de `null` | `cf79001` | En verde | En verde | En verde | **39 de 39** |
+
+Las 30 pruebas de caracterización de la Parte 1 se ejecutaron en todos estos momentos **sin modificar ni una línea**: `git diff --diff-filter=M 54f5f94 -- src/test` no muestra ningún archivo modificado (solo aparecen como agregados los archivos de prueba nuevos).
+
+El enunciado espera `Tests run: 12` al final, que corresponde solo a sus pruebas originales (6 + 4 + 2). Aquí son 39 porque se sumaron las 18 pruebas de caracterización agregadas en el Paso 2 de la Parte 1, las 3 de regresión, `contextLoads`, la prueba de arquitectura y las 4 del módulo de reportes.
+
+![Suite completa en verde en el estado final](screenshots/p2/03-suite-final-verde.png)
+
 ---
 
 ## Cómo ejecutar
@@ -224,6 +339,7 @@ Requisitos: Java 17 o superior y Maven 3.9+ (o el wrapper incluido).
 ```bash
 mvn test                                    # suite completa
 mvn test -Dtest=InventarioServiceTest       # una sola clase de prueba
+mvn test -Dtest=ArquitecturaPaquetesTest    # solo la prueba de arquitectura (ciclos entre paquetes)
 ```
 
 > En Windows con el wrapper: `.\mvnw.cmd test`.
@@ -240,6 +356,7 @@ mvn clean org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent test org.jacoco:ja
 
 - Java 17, Spring Boot 4.1.2 (Spring Boot Starter), JUnit 5
 - JaCoCo 0.8.12 (complejidad ciclomática y cobertura)
+- ArchUnit 1.3.0 (prueba de arquitectura para detectar ciclos entre paquetes)
 - Apache Maven, Git, GitHub, Visual Studio Code
 
 ---
@@ -267,8 +384,34 @@ mvn clean org.jacoco:jacoco-maven-plugin:0.8.12:prepare-agent test org.jacoco:ja
 
 **Lo que se sacrifica:** las constantes de un enum no pueden recibir beans de Spring por inyección. Si en el futuro un tipo necesitara un colaborador (por ejemplo, consultar una tarifa de envío en un servicio externo), habría que migrar a la interfaz Strategy con una clase `@Component` por tipo, y ese costo de una jerarquía adicional se pagaría entonces. Además, `ClasificadorProducto` y `EtiquetadoProducto` quedan como clases de una sola línea que delegan en el tipo, cerca de un **Middle Man** (guía, sección 1.5). Se conservan porque el checkpoint exige mantener sus firmas y porque son el punto de entrada que ya usan sus pruebas; si nadie más las necesitara, el siguiente paso sería llamar directamente a `producto.getTipo()`.
 
+### Decisión de diseño 3 — Ubicación de `NotificadorBajoStock`: ¿en `inventario` o en `reportes`?
+
+**Decisión:** la interfaz vive en `inventario`. **Alternativa descartada:** ponerla en `reportes`, junto a su única implementación.
+
+**¿Cuál es el paquete de mayor nivel de abstracción?** `inventario`. Contiene las reglas del negocio (cómo se mueve el stock, cuándo un producto necesita reorden y cuánto pedir) y no depende de cómo se presente esa información. `reportes` es un consumidor de esos eventos: decide el formato del texto y cómo se acumulan las alertas, y eso cambia más seguido (un correo, un PDF, un tablero). Aplicando la regla de la guía (sección 4.3), "los paquetes de infraestructura dependen de dominio; dominio nunca depende de infraestructura", `reportes` hace el papel de infraestructura frente a `inventario`.
+
+**Justificación:** (1) la interfaz describe lo que **necesita** `InventarioService` ("avísenme cuando un producto quede bajo el mínimo"), así que pertenece a quien la usa y no a quien la implementa; esa es la "inversión" del principio: el detalle se adapta al contrato del dominio y no al revés; (2) si la interfaz estuviera en `reportes`, `inventario` tendría que importarla y el ciclo seguiría ahí, solo que con una interfaz en lugar de una clase, y `ArquitecturaPaquetesTest` seguiría en rojo; (3) con la interfaz en `inventario` se puede agregar otro notificador (correo, cola de mensajes) en un paquete nuevo sin tocar `inventario`.
+
+La guía, en la misma sección 4.3, dice "introducir una interfaz en el paquete de **menor** nivel de abstracción". Leída literalmente, esa frase llevaría la interfaz a `reportes` y no rompería el ciclo, y contradice la regla práctica que aparece justo debajo. Aquí se siguió la regla práctica y el enunciado ("esa abstracción debe vivir junto al paquete de mayor nivel"), y la prueba de arquitectura confirma que esa es la ubicación que elimina el ciclo.
+
+**Lo que se sacrifica:** `inventario` define un contrato para un módulo que no conoce. Si los reportes necesitaran un dato nuevo (por ejemplo, la fecha del movimiento), habría que cambiar la interfaz en el dominio y no solo en `reportes`.
+
+### Decisión de diseño 4 — Granularidad de `NotificadorBajoStock`: ¿por evento o por lote?
+
+**Decisión:** un método por evento individual, `notificar(Producto producto, int cantidadReorden)`, que se llama cada vez que un movimiento deja un producto bajo el mínimo. **Alternativa descartada:** un método por lote, por ejemplo `notificar(List<Producto> productos)`.
+
+**Ventajas de la notificación por evento en este diseño:** (1) coincide con el momento en que `InventarioService` detecta el problema: cada llamada a `actualizarInventario()` mueve un solo producto, y la alerta sale en `alertarReorden()` sin que el servicio tenga que acumular nada; con un lote, el servicio necesitaría una lista de pendientes y decidir cuándo enviarla, una responsabilidad y un estado nuevos; (2) el evento lleva la `cantidadReorden` ya calculada por `Producto`, así que el receptor no tiene que volver a calcularla y la fórmula sigue en un solo lugar (ver *Decisión de diseño 1*); (3) cada llamada es una alerta, lo que hace las pruebas directas: una salida bajo el mínimo produce exactamente una línea en el reporte.
+
+**Cuándo se preferiría un lote:** cuando notificar es costoso o molesto por cada evento. Por ejemplo, si el notificador enviara un correo o llamara a la API de un proveedor, una carga masiva de inventario o un cierre de día con cientos de salidas generaría cientos de mensajes, y convendría juntar los productos bajo el mínimo y enviar un solo resumen. También en un reporte programado (por ejemplo, uno nocturno) que muestre el estado al final del día y no cada movimiento.
+
+**Lo que se sacrifica:** como cada evento se registra por separado, si el mismo producto baja del mínimo en dos salidas seguidas, el reporte muestra dos alertas para él. El reporte es un historial de alertas y no una foto del estado actual del inventario; para lo que pide el enunciado ("registrar la alerta para incluirla en el próximo reporte") es suficiente.
+
 ---
 
 ## Conclusiones
 
-La Parte 1 mostró que escribir las pruebas antes de tocar el código no es un trámite: con 31 pruebas en verde se pudo bajar `actualizarInventario()` de 44 líneas y CC 13 a 6 líneas y CC 2, y quitar los dos `switch` duplicados, sin modificar ni una prueba. Las dos decisiones salieron de la misma pregunta, a quién le pertenece cada dato: la regla de reorden terminó en `Producto` porque solo usa datos del producto, y el comportamiento por tipo terminó en `TipoProducto` porque el conjunto de tipos es cerrado y así el compilador avisa si falta algo. También quedó claro el límite de la red de seguridad: el caso `(null, 5, null)` cambiaba de comportamiento sin que ninguna prueba fallara, así que las pruebas protegen lo que cubren y lo demás hay que revisarlo leyendo el código.
+La Parte 1 mostró que escribir las pruebas antes de tocar el código no es un trámite: con ellas en verde se bajó `actualizarInventario()` de 44 líneas y CC 13 a 6 líneas y CC 2, y se quitaron los dos `switch`, sin modificar ni una prueba. Las dos decisiones salieron de preguntar a quién le pertenece cada dato, y el caso `(null, 5, null)` dejó claro que las pruebas solo protegen lo que cubren, por eso terminó con su propia prueba de regresión.
+
+La Parte 2 mostró que un problema de diseño puede pasar todas las pruebas de negocio: el ciclo entre `inventario` y `reportes` solo se vio con ArchUnit, y se resolvió dejando `NotificadorBajoStock` en el dominio. La lección más fuerte fue que ArchUnit en verde no significaba que la aplicación arrancara: quedaba un ciclo entre beans por una dependencia que ni se usaba, y solo `contextLoads` lo detectó.
+
+En general, cada tipo de prueba vio un nivel distinto del sistema (comportamiento, paquetes y objetos de Spring) y ninguna sola habría bastado. También quedó claro que el código de referencia no se puede copiar sin revisarlo: encontrar sus huecos fue parte del trabajo tanto como aplicar las técnicas.
