@@ -26,4 +26,12 @@ public class Producto {
     public int getStock() { return stock; }
     public int getStockMinimo() { return stockMinimo; }
     public void setStock(int stock) { this.stock = stock; }
+
+    public boolean necesitaReorden() {
+        return stock < stockMinimo;
+    }
+
+    public int calcularCantidadReorden() {
+        return necesitaReorden() ? (stockMinimo * 3) - stock : 0;
+    }
 }
