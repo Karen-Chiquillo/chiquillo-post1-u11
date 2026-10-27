@@ -153,6 +153,70 @@ Las pruebas no se modificaron en ningún paso: `git diff` sobre `src/test` sale 
 
 ---
 
+## Parte 2 — Acoplamiento entre Paquetes
+
+### 1. Integración del módulo de reportes
+
+Se agregó ArchUnit 1.3.0 al `pom.xml` (alcance `test`) y el paquete `reportes` con `ReporteBajoStockService`, tal como lo plantea el enunciado: recibe `InventarioService` por constructor y `InventarioService` lo recibe a él por un setter con `@Autowired(required = false)`, para avisarle desde la rama de alerta de reorden. El enunciado deja `generarReporte()` a cargo del estudiante: recorre los productos bajo el mínimo, que `InventarioService` expone con una consulta nueva, `listarProductosBajoStock()`. Esa consulta filtra con `Producto::necesitaReorden`, así que el reporte no repite la fórmula de reorden (ver *Decisión de diseño 1*).
+
+El enunciado afirma que, después de este paso, todas las pruebas siguen en verde. **No es así.** Las 30 pruebas de caracterización pasan, porque crean `InventarioService` con `new` y nunca le asignan el colaborador, pero `RefactoringU11ApplicationTests.contextLoads` falla y la aplicación no arranca:
+
+```text
+APPLICATION FAILED TO START
+Error creating bean with name 'inventarioService': Unsatisfied dependency expressed through
+method 'setReporteBajoStockService' parameter 0: Error creating bean with name 'reporteBajoStockService':
+Unsatisfied dependency expressed through constructor parameter 0: Error creating bean with name
+'inventarioService': Requested bean is currently in creation: Is there an unresolvable circular reference?
+Relying upon circular references is discouraged and they are prohibited by default.
+```
+
+Además del ciclo entre **paquetes**, que es el que pide diagnosticar el enunciado, hay un ciclo entre **objetos**: para crear `InventarioService`, Spring necesita `ReporteBajoStockService`, y para crear ese bean necesita el `InventarioService` que todavía no termina de construirse. Desde Spring Boot 2.6 las referencias circulares están prohibidas por defecto. Este estado se dejó así en el commit del módulo, igual que el enunciado lo plantea, para que el historial muestre el problema; su solución está más adelante.
+
+### 2. Diagnóstico con una prueba de arquitectura
+
+`ArquitecturaPaquetesTest` usa `slices().matching("com.universidad.refactoringu11.(*)..").should().beFreeOfCycles()`, que trata cada subpaquete como un bloque y falla si dos bloques dependen uno del otro. Ejecutada con `mvn test -Dtest=ArquitecturaPaquetesTest`, **falla** y ArchUnit detalla el ciclo:
+
+```text
+Architecture Violation [Priority: MEDIUM] - Rule 'slices matching 'com.universidad.refactoringu11.(*)..'
+should be free of cycles' was violated (1 times):
+Cycle detected: Slice inventario ->
+                Slice reportes ->
+                Slice inventario
+  1. Dependencies of Slice inventario
+    - Field <InventarioService.reporteBajoStockService> has type <ReporteBajoStockService>
+    - Method <InventarioService.setReporteBajoStockService(ReporteBajoStockService)> has parameter of type <ReporteBajoStockService>
+    - Method <InventarioService.alertarReorden(Producto)> calls method <ReporteBajoStockService.generarReporte()> in (InventarioService.java:77)
+  2. Dependencies of Slice reportes
+    - Constructor <ReporteBajoStockService.<init>(InventarioService)> has parameter of type <InventarioService>
+    - Field <ReporteBajoStockService.inventarioService> has type <InventarioService>
+    - Method <ReporteBajoStockService.generarReporte()> calls method <InventarioService.listarProductosBajoStock()> in (ReporteBajoStockService.java:19)
+    - ... y 4 llamadas más a getters y métodos de Producto (líneas 24-27)
+```
+
+*(Salida recortada: se quitó el nombre completo del paquete `com.universidad.refactoringu11` en cada clase para que se lea mejor.)*
+
+Diagrama de paquetes **antes**, con las dos flechas en sentidos opuestos:
+
+```mermaid
+flowchart LR
+    inventario["<b>inventario</b><br/>InventarioService<br/>Producto · TipoProducto"]
+    reportes["<b>reportes</b><br/>ReporteBajoStockService"]
+    inventario -- "3 dependencias: campo, setter y<br/>llamada a generarReporte()" --> reportes
+    reportes -- "7 dependencias: constructor, campo,<br/>listarProductosBajoStock() y Producto" --> inventario
+```
+
+Al mismo tiempo, las 30 pruebas de caracterización de la Parte 1 siguen en verde y sin modificar: el ciclo no cambia lo que hace `actualizarInventario()`, así que es un problema de arquitectura y no de comportamiento. Un code smell no es un bug, y por eso hizo falta una prueba distinta para verlo.
+
+| Prueba | Resultado en este punto |
+|--------|-------------------------|
+| 30 pruebas de caracterización (Parte 1) | En verde |
+| `ArquitecturaPaquetesTest` | **En rojo:** ciclo `inventario -> reportes -> inventario` |
+| `RefactoringU11ApplicationTests.contextLoads` | **En rojo:** referencia circular entre beans |
+
+![ArchUnit detecta el ciclo entre inventario y reportes](screenshots/p2/01-archunit-ciclo-rojo.png)
+
+---
+
 ## Cómo ejecutar
 
 Requisitos: Java 17 o superior y Maven 3.9+ (o el wrapper incluido).
